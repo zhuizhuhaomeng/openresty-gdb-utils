@@ -167,11 +167,11 @@ def sizeof(typ):
     return gdb.parse_and_eval("sizeof(" + typ + ")")
 
 def gcref(r):
-    return r['gcptr32'].cast(typ("uintptr_t")).cast(typ("GCobj*"))
+    return r['gcptr64'].cast(typ("uintptr_t")).cast(typ("GCobj*"))
 
 def gcrefp(r, t):
     #((t *)(void *)(uintptr_t)(r).gcptr32)
-    return r['gcptr32'].cast(typ(t + "*"))
+    return r['gcptr64'].cast(typ(t + "*"))
 
 def frame_gc(frame):
     return gcref(frame['fr']['func'])
@@ -180,7 +180,7 @@ def obj2gco(v):
     return v.cast(typ("GCobj*"))
 
 def mref(r, t):
-    return r['ptr32'].cast(typ("uintptr_t")).cast(typ(t + "*"))
+    return r['ptr64'].cast(typ("uintptr_t")).cast(typ(t + "*"))
 
 def frame_pc(f):
     return mref(f['fr']['tp']['pcr'], "BCIns")
@@ -1605,6 +1605,10 @@ ircall = [
 "lj_tab_clear",
 "lj_tab_newkey",
 "lj_tab_len",
+"lj_tab_clone",
+"lj_tab_isarray",
+"lj_tab_nkeys",
+"lj_tab_isempty",
 "lj_gc_step_jit",
 "lj_gc_barrieruv",
 "lj_mem_newgco",
@@ -1640,6 +1644,9 @@ ircall = [
 "softfp_cmp",
 "softfp_i2d",
 "softfp_d2i",
+"lj_vm_sfmin",
+"lj_vm_sfmax",
+"lj_vm_tointg",
 "softfp_ui2d",
 "softfp_f2d",
 "softfp_d2ui",
@@ -1752,7 +1759,7 @@ def litname_SLOAD(mode):
         s += "I"
     return s
 
-irfield = [ "str.len", "func.env", "func.pc", "func.ffid", "thread.env", "tab.meta", "tab.array", "tab.node", "tab.asize", "tab.hmask", "tab.nomm", "udata.meta", "udata.udtype", "udata.file", "cdata.ctypeid", "cdata.ptr", "cdata.int", "cdata.int64", "cdata.int64_4" ]
+irfield = [ "str.len", "func.env", "func.pc", "func.ffid", "thread.env", "thread.exdata", "tab.meta", "tab.array", "tab.node", "tab.asize", "tab.hmask", "tab.nomm", "udata.meta", "udata.udtype", "udata.file", "cdata.ctypeid", "cdata.ptr", "cdata.int", "cdata.int64", "cdata.int64_4" ]
 
 def litname_irfield(mode):
     return irfield[int(mode)]
@@ -1810,8 +1817,6 @@ def litname(op):
 
     return None
 
-IR_KSLOT = 30
-
 IR_KPRI = 22
 IR_KINT = 23
 IR_KGC = 24
@@ -1821,6 +1826,7 @@ IR_KNULL = 27
 IR_KNUM = 28
 IR_KINT64 = 29
 IR_KSLOT = 30
+LJ_GC64 = 1
 
 def irt_toitype_(t):
     if t > IRT_NUM:
@@ -1835,13 +1841,13 @@ def irt_toitype(t):
     return irt_toitype_(irt_type(t))
 
 def ir_kgc(ir):
-    return gcref(ir['gcr'])
+    return gcref(ir[LJ_GC64]['gcr'])
 
 def ir_knum(ir):
-    return mref(ir['ptr'], "TValue")
+    return ir[1]['tv'].address
 
 def ir_kint64(ir):
-    return mref(ir['ptr'], 'TValue')
+    return ir[1]['tv'].address
 
 def lj_ir_kvalue(ir):
     t = ir['o']
@@ -1860,7 +1866,7 @@ def lj_ir_kvalue(ir):
         return 0, "userdata"
 
     if t == IR_KPTR or t == IR_KKPTR:
-        return ptr2int(mref(ir['ptr'], "void")), "userdata"
+        return ptr2int(mref(ir[LJ_GC64]['ptr'], "void")), "userdata"
 
     if t == IR_KNUM:
         return float(ir_knum(ir)['n']), "number"
@@ -1905,6 +1911,7 @@ ffnames = [
 "rawget",
 "rawset",
 "rawequal",
+"rawlen",
 "unpack",
 "select",
 "tonumber",
@@ -1922,11 +1929,13 @@ ffnames = [
 "print",
 "coroutine.status",
 "coroutine.running",
+"coroutine.isyieldable",
 "coroutine.create",
 "coroutine.yield",
 "coroutine.resume",
 "coroutine.wrap_aux",
 "coroutine.wrap",
+"thread.exdata",
 "math.abs",
 "math.floor",
 "math.ceil",
@@ -1982,7 +1991,12 @@ ffnames = [
 "table.maxn",
 "table.insert",
 "table.concat",
+"table.clone",
+"table.isarray",
+"table.nkeys",
+"table.isempty",
 "table.sort",
+"table.pack",
 "table.new",
 "table.clear",
 "io.method.close",
@@ -2028,6 +2042,8 @@ ffnames = [
 "debug.setupvalue",
 "debug.upvalueid",
 "debug.upvaluejoin",
+"debug.getuservalue",
+"debug.setuservalue",
 "debug.sethook",
 "debug.gethook",
 "debug.debug",
@@ -2037,6 +2053,7 @@ ffnames = [
 "jit.flush",
 "jit.status",
 "jit.attach",
+"jit.prngstate",
 "jit.util.funcinfo",
 "jit.util.funcbc",
 "jit.util.funck",
@@ -2079,6 +2096,7 @@ ffnames = [
 "ffi.new",
 "ffi.cast",
 "ffi.typeof",
+"ffi.typeinfo",
 "ffi.istype",
 "ffi.sizeof",
 "ffi.alignof",
@@ -2128,16 +2146,22 @@ def fmtfunc(fn):
                 sym = "C:%s" % key
         return sym
 
-def formatk(tr, idx):
+def formatk(tr, idx, sn=None):
     #return "<k>"
     k, it, t, slot = tracek(tr, idx)
-    #print("type: ", it)
+    #print("type: ", it, "k: ", k, " ")
     s = None
     if it == "number":
-        if k == 2 ** 52 + 2 ** 51:
+
+        if sn is None:
+            sn = 0;
+        if sn & 0x30000:
+            s = "contpc" if (sn & 0x20000)  else "ftsz"
+        elif k == 2 ** 52 + 2 ** 51:
             s = "bias"
         else:
-            #print("BEFORE")
+            # XXX
+            #s = format(0 < k and k < 0x1p-1026 and "%+a" or "%+.14g", k)
             s = "%+.14g" % k
 
     elif it == "string":
@@ -2161,17 +2185,22 @@ def formatk(tr, idx):
     elif it == "function":
         s = fmtfunc(k.cast(typ("GCfunc*")))
 
+    elif it == "table":
+        s = "{%#010x}" % k  #XXX 010 needed?
+
     elif it == "userdata":
         if t == 12:
             s = "userdata:%#x" % k
         else:
             s = "[%#010x]" % k
             if k == 0:
-                s = "[NULL]"
+                s = "NULL"
     elif t == 21:  # int64_t
-        s = str(k)
+        s = str(k) # s = sub(tostring(k), 1, -3) XXX remove last tow
         if s[0] != "-":
             s = "+" + s
+    elif sn == 0x1057fff: # SNAP(1, SNAP_FRAME | SNAP_NORESTORE, REF_NIL)
+        return "----" # Special case for LJ_FR2 slot 1.
     else:
         s = str(k)
 
@@ -2192,13 +2221,14 @@ def tracesnap(T, sn):
         size = nent + 2
         t = []
         int32_t = typ("int32_t")
+        uint32_t = typ("uint32_t")
         t.append(snap['ref'].cast(int32_t) - REF_BIAS)
         t.append(snap['nslots'].cast(int32_t))
         n = 0
         while n < nent:
-            t.append(map[n].cast(int32_t))
+            t.append(map[n].cast(uint32_t))
             n += 1
-        t.append(SNAP(255, 0, 0).cast(int32_t))
+        t.append(SNAP(255, 0, 0).cast(uint32_t))
         return t
     return None
 
@@ -2235,10 +2265,11 @@ def printsnap(T, snap):
             n += 1
             ref = (sn & 0xffff) - REF_BIAS
             if ref < 0:
-                out(formatk(T, ref))
+                out(formatk(T, ref, sn))
             elif (sn & 0x80000) != 0:  # SNAP_SOFTFPNUM
                 out("%04d/%04d" % (ref, ref+1))
             else:
+                #m, ot, op1, op2 = traceir(T, ref)
                 out("%04d" % ref)
             out((sn & 0x10000) == 0 and " " or "|") # SNAP_FRAME
         else:
@@ -2714,7 +2745,7 @@ class lgcpath(lgcstat):
         self.baseclass.init_sizeof()
         self.visited.clear()
 
-        # step 1: DFS registry 
+        # step 1: DFS registry
         g = G(L)
         self.path_root = 1
         self.visit_tval(g['registrytv'], g)
@@ -2862,7 +2893,7 @@ class lgcpath(lgcstat):
     def print_proto(self, proto, g):
         name = proto_chunkname(proto)
         if name:
-            path = lstr2str(name) 
+            path = lstr2str(name)
             out("proto(%s:%d)" % (path, int(proto['firstline'])))
         else:
             out("proto ")
